@@ -14,9 +14,9 @@ import logging
 sys.path.append(str(Path(__file__).parent))
 
 import config
-from preprocessing.preprocess import MosaicPreprocessor, load_mosaic, save_mosaic
-from preprocessing.proxy_labels import ProxyLabelGenerator, visualize_proxy_label
-from utils.logger import setup_logging
+from preprocessing.preprocessing.preprocess import MosaicPreprocessor, load_mosaic, save_mosaic
+from preprocessing.preprocessing.proxy_labels import ProxyLabelGenerator, visualize_proxy_label
+from utils.utils.logger import setup_logging
 
 # Setup logging
 setup_logging(config.LOGS_DIR, log_level='INFO', log_to_file=False, log_to_console=True)

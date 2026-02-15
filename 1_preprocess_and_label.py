@@ -19,9 +19,9 @@ import logging
 sys.path.append(str(Path(__file__).parent))
 
 import config
-from preprocessing.preprocess import MosaicPreprocessor, extract_patches, load_mosaic, save_mosaic
-from preprocessing.proxy_labels import ProxyLabelGenerator, visualize_proxy_label
-from utils.logger import setup_logging
+from preprocessing.preprocessing.preprocess import MosaicPreprocessor, extract_patches, load_mosaic, save_mosaic
+from preprocessing.preprocessing.proxy_labels import ProxyLabelGenerator, visualize_proxy_label
+from utils.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
