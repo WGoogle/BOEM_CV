@@ -205,6 +205,10 @@ PROXY_LABEL = {
 If you use this pipeline, please cite:
 
 ```
+Brian Hwang, Kailash Ramesh, Thang Nguyen
+"Automated Identification of Deep-Sea Polymetallic Nodules from Seafloor Imagery Continuation"
+BOEM Symposium, 2026
+
 Manasvi Lodha, Inez Alvarez, Hitha Varganti, Vihaan Khandelwal
 "Automated Deep-Learning Segmentation and Density Analysis of 
 Polymetallic Nodules in Deep-Sea Seafloor Imagery"
@@ -219,11 +223,5 @@ Bureau of Ocean Energy Management (BOEM):
 - Kevin Smith
 - Obediah Racicot
 
-## 📧 Contact
-
-For questions or issues, contact:
-- Manasvi Lodha: manasvi.lodha@berkeley.edu
-
----
 
 **Note**: This is a research pipeline. Validate results on your specific dataset before operational use.
