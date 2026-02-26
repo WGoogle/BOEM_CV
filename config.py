@@ -36,14 +36,25 @@ PREPROCESSING = {
     
     # CLAHE parameters (LAB space)
     'apply_clahe': True,
-    'clahe_clip_limit': 2.0,
-    'clahe_tile_grid_size': (8, 8),
+    'clahe_clip_limit': 3.0,
+    'clahe_tile_grid_size': (24, 24),
     
     # Bilateral filtering for noise reduction
     'apply_bilateral': True,
-    'bilateral_d': 9,
-    'bilateral_sigma_color': 75,
-    'bilateral_sigma_space': 75,
+    'bilateral_d': 5,
+    'bilateral_sigma_color': 50,
+    'bilateral_sigma_space': 50,
+    
+    # Nodule boost parameters
+    'apply_nodule_boost': True,
+    'nodule_contrast_threshold': 20,  
+    'nodule_bg_blur_sigma': 30,   
+    'nodule_boost': 2.0,  
+
+    # Unsharp Mask
+    'apply_unsharp_mask': True,
+    'unsharp_sigma': 1.5,
+    'unsharp_strength': 0.2,
     
     # Patch extraction
     'patch_height': 192,

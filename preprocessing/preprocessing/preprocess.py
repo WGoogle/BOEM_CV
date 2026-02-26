@@ -128,6 +128,61 @@ class MosaicPreprocessor:
         
         logger.debug("Applied bilateral filter")
         return filtered
+
+    def apply_nodule_boost(self, image: np.ndarray) -> np.ndarray:
+        if not self.config.get('apply_nodule_boost', False):
+            return image
+
+        threshold  = self.config.get('nodule_contrast_threshold', 20)
+        amplify    = self.config.get('nodule_boost', 2.0)
+        bg_sigma   = self.config.get('nodule_bg_blur_sigma', 30)
+
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        # CRITICAL: compute local_darkness from the PRE-CLAHE L channel (stored in
+        # self._l_pre_clahe by preprocess_mosaic).  Using the post-CLAHE L causes
+        # the bright halos CLAHE creates around nodules to inflate apparent "darkness"
+        # in surrounding sediment pixels, producing false dark dots.
+        # If pre-CLAHE L is not available (e.g. called standalone), fall back to current L.
+        l_ref = getattr(self, '_l_pre_clahe', l).astype(np.float32)
+
+        # How much darker is each pixel than its local background?
+        local_bg       = cv2.GaussianBlur(l_ref, (0, 0), bg_sigma)
+        local_darkness = np.clip(local_bg - l_ref, 0, 255)
+
+        # Non-linear gate: ramps from 0→1 over [threshold, threshold+30]
+        # Sediment texture (~7 pts dark): weight ≈ 0  → not amplified
+        # Real nodules (~36 pts dark):    weight ≈ 0.5+ → clearly amplified
+        amplify_weight = np.clip((local_darkness - threshold) / 30.0, 0, 1.0)
+
+        # Apply darkening to the post-CLAHE L channel
+        l_boosted = np.clip(l.astype(np.float32) - amplify_weight * local_darkness * amplify, 0, 255).astype(np.uint8)
+
+        logger.debug("Applied contrast-selective nodule boost")
+        return cv2.cvtColor(cv2.merge([l_boosted, a, b]), cv2.COLOR_LAB2BGR)
+    
+    def apply_unsharp_mask(self, image: np.ndarray) -> np.ndarray:
+        """
+        Sharpen nodule boundaries by applying unsharp masking on the L channel.
+        Controlled by config keys: apply_unsharp_mask, unsharp_sigma, unsharp_strength.
+        """
+        if not self.config.get('apply_unsharp_mask', False):
+            return image
+
+        sigma    = self.config.get('unsharp_sigma', 2.0)
+        strength = self.config.get('unsharp_strength', 0.5)
+
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        blur    = cv2.GaussianBlur(l, (0, 0), sigma)
+        l_sharp = np.clip(l.astype(np.int16) + strength * (l.astype(np.int16) - blur.astype(np.int16)), 0, 255).astype(np.uint8)
+
+        sharpened = cv2.merge([l_sharp, a, b])
+        logger.debug("Applied unsharp mask")
+        return cv2.cvtColor(sharpened, cv2.COLOR_LAB2BGR)
+    
     
     def preprocess_mosaic(self, image: np.ndarray) -> np.ndarray:
         """
@@ -139,6 +194,7 @@ class MosaicPreprocessor:
         Returns:
             Preprocessed mosaic (H, W, 3) uint8
         """
+        
         # 1. Orientation normalization
         image = self.normalize_orientation(image)
         
@@ -148,11 +204,21 @@ class MosaicPreprocessor:
         # 3. Gray-world white balance
         image = self.apply_gray_world_white_balance(image)
         
-        # 4. CLAHE in LAB space
+        # 4. Bilateral filtering
+        image = self.apply_bilateral_filter(image)
+        
+        # Snapshot the L channel before CLAHE so apply_nodule_boost can use
+        # true (halo-free) contrast for its darkness estimate
+        self._l_pre_clahe = cv2.split(cv2.cvtColor(image, cv2.COLOR_BGR2LAB))[0]
+
+        # 5. CLAHE in LAB space
         image = self.apply_clahe_lab(image)
         
-        # 5. Bilateral filtering
-        image = self.apply_bilateral_filter(image)
+        # 6. applying nodule boost 
+        image = self.apply_nodule_boost(image)
+
+        # 7. Unsharp masking 
+        image = self.apply_unsharp_mask(image)
         
         logger.info(f"Preprocessed mosaic: shape={image.shape}, dtype={image.dtype}")
         return image
