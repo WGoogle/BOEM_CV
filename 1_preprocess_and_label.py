@@ -119,6 +119,7 @@ def extract_and_save_patches(preprocessed_files, proxy_label_files):
     logger.info("="*80)
     
     patch_config = config.PREPROCESSING
+    manual_dir = config.MANUAL_LABELS_DIR
     
     # Create patch directories
     patch_images_dir = config.PATCHES_DIR / "images"
@@ -152,10 +153,22 @@ def extract_and_save_patches(preprocessed_files, proxy_label_files):
             for i, (y, x) in enumerate(coords):
                 patch_h = patch_config['patch_height']
                 patch_w = patch_config['patch_width']
-                mask_patch = mask[y:y+patch_h, x:x+patch_w]
+                
+                # Generate the standard patch ID
+                patch_id = f"{mosaic_path.stem}_patch_{i:04d}"
+                
+                #Check for ground truth
+                manual_patch_path = manual_dir / f"{patch_id}.png"
+                
+                if manual_patch_path.exists():
+                    # Load the manual binary mask instead of slicing the proxy
+                    mask_patch = cv2.imread(str(manual_patch_path), cv2.IMREAD_GRAYSCALE)
+                else:
+                    # Default: Extract from proxy mask
+                    mask_patch = mask[y:y+patch_h, x:x+patch_w]
+                # ----------------------------------------------------
                 
                 # Save patches
-                patch_id = f"{mosaic_path.stem}_patch_{i:04d}"
                 image_patch_path = patch_images_dir / f"{patch_id}.png"
                 mask_patch_path = patch_masks_dir / f"{patch_id}.png"
                 
