@@ -74,16 +74,28 @@ PROXY_LABEL = {
     'gaussian_kernel_size': 5,
     'gaussian_sigma': 1.0,
     
+
+    # Stats-based adaptive threshold: t = mean - threshold_k * std
+    # Replaces Otsu — old Otsu was labelling 42% of image as nodule (wrong direction)
+    # k=2.2 → threshold ≈ 26 on a typical preprocessed mosaic 
+    'threshold_k':   2.2,   # raise to be more selective, lower to catch more nodules
+    'threshold_min': 20,    # safety clamp (lower bound)
+    'threshold_max': 70,    # safety clamp (upper bound)
+
+
     # Morphological operations
     'morph_opening_kernel': 3,
-    'morph_closing_kernel': 5,
+    'morph_closing_kernel': 7,
     
     # Contour filtering (nodule characteristics)
-    'min_contour_area': 20,
+    'min_contour_area': 15,
     'max_contour_area': 2000,
     'min_eccentricity': 0.0,
-    'max_eccentricity': 0.95,
-    'min_solidity': 0.5,
+    'max_eccentricity': 0.85,
+    'min_solidity': 0.55,
+
+    'large_area_threshold':     200,   # px² cutoff between small/large eccentricity limits
+    'large_eccentricity_limit': 0.95,  # relaxed limit for large blobs
 }
 
 # ==============================================================================

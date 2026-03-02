@@ -28,9 +28,6 @@ class ProxyLabelGenerator:
         """
         self.config = config
         
-        # Create CLAHE for grayscale enhancement
-        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        
         # Create morphological kernels
         self.opening_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
@@ -41,181 +38,156 @@ class ProxyLabelGenerator:
             (config['morph_closing_kernel'], config['morph_closing_kernel'])
         )
     
-    def convert_to_grayscale(self, image: np.ndarray) -> np.ndarray:
-        """Convert BGR image to grayscale."""
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image.copy()
-        return gray
-    
-    def enhance_contrast(self, gray: np.ndarray) -> np.ndarray:
-        """Apply CLAHE to enhance local contrast."""
-        enhanced = self.clahe.apply(gray)
-        logger.debug("Applied CLAHE enhancement")
-        return enhanced
-    
-    def apply_gaussian_blur(self, image: np.ndarray) -> np.ndarray:
-        """Apply Gaussian blur to stabilize thresholding."""
-        if not self.config['apply_gaussian_blur']:
-            return image
-        
+    def convert_to_grayscale(self, image: np.ndarray):
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
+
+    def apply_gaussian_blur(self, gray: np.ndarray):
+        """Mild blur to merge split nodule fragments before thresholding."""
+        if not self.config.get('apply_gaussian_blur', True):
+            return gray
         ksize = self.config['gaussian_kernel_size']
         sigma = self.config['gaussian_sigma']
-        
-        blurred = cv2.GaussianBlur(image, (ksize, ksize), sigma)
-        logger.debug(f"Applied Gaussian blur (ksize={ksize}, sigma={sigma})")
-        return blurred
-    
-    def otsu_threshold(self, gray: np.ndarray) -> np.ndarray:
+        return cv2.GaussianBlur(gray, (ksize, ksize), sigma)
+
+    def adaptive_threshold(self, gray: np.ndarray):
         """
-        Apply Otsu's method for automatic thresholding.
-        Returns binary mask where 255 = nodule candidate, 0 = background.
+        Stats-based threshold: keeps pixels that are significantly darker
+        than the image mean.
+
+        threshold = mean - threshold_k * std
+        clamped to [threshold_min, threshold_max] for safety.
+
+        Why not Otsu: the preprocessed image has a bimodal histogram where the
+        dominant mode is background (mean ~100).  Otsu picks ~86, which labels
+        29 % of the image as nodule.  Our method anchors to the actual image
+        statistics and yields ~5-9 % coverage — consistent with more of the 14ish percent we see on presentation.
         """
-        # Otsu's method
-        threshold_value, binary = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        
-        # Invert if needed (we want nodules to be bright, background dark)
-        # In underwater imagery, nodules are typically brighter than sediment
-        # But we'll invert to get nodules as white (255)
-        binary_inv = cv2.bitwise_not(binary)
-        
-        logger.debug(f"Otsu threshold value: {threshold_value:.2f}")
-        return binary_inv
-    
-    def morphological_cleanup(self, binary: np.ndarray) -> np.ndarray:
+        m   = float(gray.mean())
+        s   = float(gray.std())
+        k   = self.config.get('threshold_k', 2.2)
+        lo  = self.config.get('threshold_min', 20)
+        hi  = self.config.get('threshold_max', 70)
+        t   = float(np.clip(m - k * s, lo, hi))
+
+        _, binary = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY_INV)
+        logger.debug(f"Adaptive threshold: mean={m:.1f} std={s:.1f} k={k} → t={t:.1f}")
+        return binary
+
+    def morphological_cleanup(self, binary: np.ndarray):
         """
-        Apply morphological opening and closing to remove artifacts and fill gaps.
-        - Opening: removes small bright spots (noise)
-        - Closing: fills small holes in nodules
+        Opening removes isolated noise pixels.
+        Closing merges split halves of the same nodule.
         """
-        # Opening (erosion followed by dilation)
-        opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, self.opening_kernel)
-        
-        # Closing (dilation followed by erosion)
-        closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, self.closing_kernel)
-        
+        opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  self.opening_kernel)
+        closed = cv2.morphologyEx(opened,  cv2.MORPH_CLOSE, self.closing_kernel)
         logger.debug("Applied morphological opening and closing")
         return closed
-    
-    def compute_contour_features(self, contour) -> dict:
-        """
-        Compute geometric features of a contour for filtering.
-        
-        Returns:
-            Dict with area, eccentricity, solidity
-        """
+
+    def compute_contour_features(self, contour):
+        """Compute area, eccentricity, and solidity for a contour."""
         area = cv2.contourArea(contour)
-        
-        if area < 5:  # Too small to compute features reliably
+        if area < 5:
             return {'area': area, 'eccentricity': 1.0, 'solidity': 0.0}
-        
-        # Fit ellipse to compute eccentricity (if enough points)
+
+        # Eccentricity via fitted ellipse
+        eccentricity = 0.0
         if len(contour) >= 5:
             try:
-                ellipse = cv2.fitEllipse(contour)
-                (_, _), (MA, ma), _ = ellipse
-                
-                # Avoid division by zero
-                if MA > 0:
-                    eccentricity = np.sqrt(1 - (ma / MA) ** 2) if MA >= ma else 0.0
-                else:
-                    eccentricity = 0.0
-            except:
-                eccentricity = 0.0
-        else:
-            eccentricity = 0.0
-        
+                _, (MA, ma), _ = cv2.fitEllipse(contour)
+                long, short = max(MA, ma), min(MA, ma)
+                if long > 0:
+                    eccentricity = float(np.sqrt(1.0 - (short / long) ** 2))
+            except Exception:
+                pass
+
         # Solidity = area / convex hull area
-        hull = cv2.convexHull(contour)
-        hull_area = cv2.contourArea(hull)
-        solidity = area / hull_area if hull_area > 0 else 0.0
-        
-        return {
-            'area': area,
-            'eccentricity': eccentricity,
-            'solidity': solidity
-        }
-    
+        hull_area = cv2.contourArea(cv2.convexHull(contour))
+        solidity   = area / hull_area if hull_area > 0 else 0.0
+
+        return {'area': area, 'eccentricity': eccentricity, 'solidity': solidity}
+
     def filter_contours(self, binary: np.ndarray) -> Tuple[list, np.ndarray]:
         """
-        Find contours and filter by area, eccentricity, and solidity.
-        
-        Returns:
-            filtered_contours: List of valid contours
-            filtered_mask: Binary mask with only valid nodules
+        Keep only contours whose area, eccentricity, and solidity fall within
+        the configured nodule ranges.
+
+        Eccentricity is applied as a SIZE-DEPENDENT filter:
+        - Small blobs (< large_area_threshold px²): strict max_eccentricity
+          — rejects elongated sediment trails and thin noise.
+        - Large blobs (≥ large_area_threshold px²): relaxed large_eccentricity_limit
+          — nodule clusters merge into slightly elongated shapes; we still want them.
         """
-        # Find contours
         contours, _ = cv2.findContours(
             binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        
-        if len(contours) == 0:
-            logger.debug("No contours found")
+
+        if not contours:
             return [], np.zeros_like(binary)
-        
-        # Filter contours
-        filtered_contours = []
-        for contour in contours:
-            features = self.compute_contour_features(contour)
-            
-            # Apply filters
-            if (self.config['min_contour_area'] <= features['area'] <= self.config['max_contour_area'] and
-                self.config['min_eccentricity'] <= features['eccentricity'] <= self.config['max_eccentricity'] and
-                features['solidity'] >= self.config['min_solidity']):
-                filtered_contours.append(contour)
-        
-        # Create filtered mask
-        filtered_mask = np.zeros_like(binary)
-        if len(filtered_contours) > 0:
-            cv2.drawContours(filtered_mask, filtered_contours, -1, 255, thickness=cv2.FILLED)
-        
-        logger.debug(f"Filtered {len(filtered_contours)}/{len(contours)} contours")
-        return filtered_contours, filtered_mask
+
+        large_area_thresh  = self.config.get('large_area_threshold',      200)
+        large_ecc_limit    = self.config.get('large_eccentricity_limit',  0.95)
+
+        filtered = []
+        for c in contours:
+            f = self.compute_contour_features(c)
+
+            if not (self.config['min_contour_area'] <= f['area'] <= self.config['max_contour_area']):
+                continue
+            if f['solidity'] < self.config['min_solidity']:
+                continue
+
+            # Size-dependent eccentricity threshold
+            ecc_limit = large_ecc_limit if f['area'] >= large_area_thresh \
+                        else self.config['max_eccentricity']
+            if not (self.config['min_eccentricity'] <= f['eccentricity'] <= ecc_limit):
+                continue
+
+            filtered.append(c)
+
+        mask = np.zeros_like(binary)
+        if filtered:
+            cv2.drawContours(mask, filtered, -1, 255, thickness=cv2.FILLED)
+
+        logger.debug(f"Filtered {len(filtered)}/{len(contours)} contours")
+        return filtered, mask
     
     def generate_proxy_label(self, image: np.ndarray) -> Tuple[np.ndarray, dict]:
         """
         Full proxy label generation pipeline.
-        
+
         Args:
-            image: Preprocessed patch/mosaic (H, W, C) in BGR
-            
+            image: Preprocessed mosaic/patch (H, W, C) BGR
+
         Returns:
-            proxy_mask: Binary mask (H, W) with 0=background, 255=nodule
-            stats: Dictionary with generation statistics
+            proxy_mask: Binary mask (H, W) — 0 = background, 255 = nodule
+            stats:      Generation statistics dict
         """
-        # 1. Convert to grayscale
+        # 1. Grayscale
         gray = self.convert_to_grayscale(image)
-        
-        # 2. Enhance contrast
-        enhanced = self.enhance_contrast(gray)
-        
-        # 3. Gaussian blur for stability
-        blurred = self.apply_gaussian_blur(enhanced)
-        
-        # 4. Otsu thresholding
-        binary = self.otsu_threshold(blurred)
-        
-        # 5. Morphological cleanup
+
+        # 2. Mild blur (merge split fragments)
+        blurred = self.apply_gaussian_blur(gray)
+
+        # 3. Stats-based adaptive threshold (dark pixels = nodules)
+        binary = self.adaptive_threshold(blurred)
+
+        # 4. Morphological cleanup
         cleaned = self.morphological_cleanup(binary)
-        
-        # 6. Filter contours
+
+        # 5. Shape-based contour filtering
         contours, proxy_mask = self.filter_contours(cleaned)
-        
-        # Compute statistics
+
+        n_before = len(cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0])
         stats = {
-            'num_candidates_before_filter': len(cv2.findContours(
-                cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )[0]),
-            'num_nodules_after_filter': len(contours),
-            'coverage_percent': (np.sum(proxy_mask > 0) / proxy_mask.size) * 100
+            'num_candidates_before_filter': n_before,
+            'num_nodules_after_filter':     len(contours),
+            'coverage_percent':             100.0 * np.sum(proxy_mask > 0) / proxy_mask.size,
         }
-        
-        logger.info(f"Generated proxy label: {stats['num_nodules_after_filter']} nodules, "
-                   f"{stats['coverage_percent']:.2f}% coverage")
-        
+
+        logger.info(
+            f"Proxy label: {stats['num_nodules_after_filter']} nodules, "
+            f"{stats['coverage_percent']:.2f}% coverage"
+        )
         return proxy_mask, stats
 
 
