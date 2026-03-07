@@ -89,8 +89,13 @@ def generate_proxy_labels(preprocessed_files):
             # Load preprocessed mosaic
             mosaic = cv2.imread(str(mosaic_path), cv2.IMREAD_COLOR)
             
-            # Generate proxy label
-            proxy_mask, stats = label_generator.generate_proxy_label(mosaic)
+            # Generate proxy label (debug_dir saves intermediate images)
+            debug_dir = str(config.OUTPUT_DIR / "debug_proxy")
+            proxy_mask, stats = label_generator.generate_proxy_label(
+                mosaic,
+                debug_dir=debug_dir,
+                debug_prefix=mosaic_path.stem,
+            )
             
             # Save mask
             mask_path = config.PROXY_LABELS_DIR / f"{mosaic_path.stem}_mask.png"

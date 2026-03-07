@@ -130,36 +130,75 @@ class MosaicPreprocessor:
         return filtered
 
     def apply_nodule_boost(self, image: np.ndarray) -> np.ndarray:
+        """
+        Enhance dark nodule blobs while suppressing sediment texture using two
+        complementary signals:
+
+        1. Morphological Bottom-Hat Transform
+           A morphological closing with an elliptical SE sized to the expected
+           maximum nodule diameter fills in dark nodule "holes", turning them
+           bright.  Subtracting the original (bottom-hat = close(L) - L) gives
+           a response that is large only where a dark compact blob smaller than
+           the SE exists — i.e., exactly where nodules sit.  This avoids the
+           Gaussian-blur halo artefact of the previous approach.
+
+        2. Sediment Texture Gate
+           Fine-grained sediment has high local standard deviation at small
+           pixel scales (2-3 px) because individual grains differ in brightness.
+           Nodule surfaces are smooth, so their local std is low at the same
+           scale.  A per-pixel weight ramps from 1 → 0 as the local std rises
+           above `sediment_texture_threshold`, preventing sediment from being
+           darkened even if it happens to sit near the bottom-hat response.
+
+        Both signals are computed on the PRE-CLAHE L channel to avoid the
+        bright halos CLAHE creates around nodule edges.
+        """
         if not self.config.get('apply_nodule_boost', False):
             return image
 
-        threshold  = self.config.get('nodule_contrast_threshold', 20)
-        amplify    = self.config.get('nodule_boost', 2.0)
-        bg_sigma   = self.config.get('nodule_bg_blur_sigma', 30)
+        amplify       = self.config.get('nodule_boost', 2.0)
+        morph_radius  = self.config.get('nodule_morph_radius', 20)
+        tex_sigma     = self.config.get('sediment_texture_sigma', 2.0)
+        tex_threshold = self.config.get('sediment_texture_threshold', 12.0)
+        max_darken    = self.config.get('nodule_max_darkening', 70)
 
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
 
-        # CRITICAL: compute local_darkness from the PRE-CLAHE L channel (stored in
-        # self._l_pre_clahe by preprocess_mosaic).  Using the post-CLAHE L causes
-        # the bright halos CLAHE creates around nodules to inflate apparent "darkness"
-        # in surrounding sediment pixels, producing false dark dots.
-        # If pre-CLAHE L is not available (e.g. called standalone), fall back to current L.
-        l_ref = getattr(self, '_l_pre_clahe', l).astype(np.float32)
+        # Use pre-CLAHE L to avoid halo artefacts (set by preprocess_mosaic).
+        l_ref    = getattr(self, '_l_pre_clahe', l)
+        l_ref_u8 = l_ref.astype(np.uint8)
 
-        # How much darker is each pixel than its local background?
-        local_bg       = cv2.GaussianBlur(l_ref, (0, 0), bg_sigma)
-        local_darkness = np.clip(local_bg - l_ref, 0, 255)
+        # ── 1. Bottom-Hat Transform ──────────────────────────────────────────
+        # SE diameter larger than the biggest expected nodule so closing fully
+        # fills dark nodule regions.  Elliptical SE matches nodule morphology.
+        se_size    = 2 * morph_radius + 1
+        se         = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (se_size, se_size))
+        closed     = cv2.morphologyEx(l_ref_u8, cv2.MORPH_CLOSE, se)
+        bottom_hat = cv2.subtract(closed, l_ref_u8).astype(np.float32)  # [0, 255]
 
-        # Non-linear gate: ramps from 0→1 over [threshold, threshold+30]
-        # Sediment texture (~7 pts dark): weight ≈ 0  → not amplified
-        # Real nodules (~36 pts dark):    weight ≈ 0.5+ → clearly amplified
-        amplify_weight = np.clip((local_darkness - threshold) / 30.0, 0, 1.0)
+        # ── 2. Sediment Texture Gate ─────────────────────────────────────────
+        # Local mean at fine scale; deviation from it ≈ grain-level texture.
+        blur_fine     = cv2.GaussianBlur(l_ref_u8.astype(np.float32), (0, 0), tex_sigma)
+        abs_diff      = np.abs(l_ref_u8.astype(np.float32) - blur_fine)
+        texture_score = cv2.GaussianBlur(abs_diff, (0, 0), tex_sigma * 1.5)
 
-        # Apply darkening to the post-CLAHE L channel
-        l_boosted = np.clip(l.astype(np.float32) - amplify_weight * local_darkness * amplify, 0, 255).astype(np.uint8)
+        # Weight: 1 for smooth surfaces (nodules), ramps to 0 for textured sediment.
+        texture_weight = np.clip(1.0 - texture_score / tex_threshold, 0.0, 1.0)
 
-        logger.debug("Applied contrast-selective nodule boost")
+        # ── 3. Combined Darkening ────────────────────────────────────────────
+        # nodule_signal ∈ [0, 1]: high only where bottom-hat response is strong
+        # AND the surface is smooth (low texture).
+        nodule_signal = (bottom_hat / 255.0) * texture_weight
+        darkening     = np.clip(amplify * nodule_signal * bottom_hat, 0.0, max_darken)
+
+        l_boosted = np.clip(l.astype(np.float32) - darkening, 0, 255).astype(np.uint8)
+
+        logger.debug(
+            f"Nodule boost: bottom-hat SE r={morph_radius}px, "
+            f"tex gate σ={tex_sigma}/{tex_threshold}, "
+            f"max_darken={max_darken}, amplify={amplify}"
+        )
         return cv2.cvtColor(cv2.merge([l_boosted, a, b]), cv2.COLOR_LAB2BGR)
     
     def apply_unsharp_mask(self, image: np.ndarray) -> np.ndarray:
@@ -206,7 +245,7 @@ class MosaicPreprocessor:
         
         # 4. Bilateral filtering
         image = self.apply_bilateral_filter(image)
-        
+
         # Snapshot the L channel before CLAHE so apply_nodule_boost can use
         # true (halo-free) contrast for its darkness estimate
         self._l_pre_clahe = cv2.split(cv2.cvtColor(image, cv2.COLOR_BGR2LAB))[0]
