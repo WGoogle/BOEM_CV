@@ -50,7 +50,7 @@ PREPROCESSING = {
     'apply_nodule_boost': True,
     'nodule_contrast_threshold': 20,  
     'nodule_bg_blur_sigma': 30,   
-    'nodule_boost': 2.0,  
+    'nodule_boost': 1.2,
 
     # Unsharp Mask
     'apply_unsharp_mask': True,
@@ -70,33 +70,31 @@ PREPROCESSING = {
 # PROXY LABEL GENERATION (Classical CV for weak supervision)
 # ==============================================================================
 PROXY_LABEL = {
-    # Otsu thresholding parameters
+    # Pre-blur to suppress sediment speckle before top-hat
     'apply_gaussian_blur': True,
-    'gaussian_kernel_size': 5,
-    'gaussian_sigma': 1.0,
-    
+    'gaussian_kernel_size': 3,
+    'gaussian_sigma': 0.8,
 
-    # Stats-based adaptive threshold: t = mean - threshold_k * std
-    # Replaces Otsu — old Otsu was labelling 42% of image as nodule (wrong direction)
-    # k=2.2 → threshold ≈ 26 on a typical preprocessed mosaic 
-    'threshold_k':   2.2,   # raise to be more selective, lower to catch more nodules
-    'threshold_min': 20,    # safety clamp (lower bound)
-    'threshold_max': 70,    # safety clamp (upper bound)
+    # Multi-scale black top-hat kernel sizes (must exceed target nodule diameter)
+    'tophat_kernel_sizes': [11, 21, 41, 61],
+    'tophat_response_blur_sigma': 1.0,
+    'tophat_threshold_percentile': 80,      # keep top 20% of response
+    'tophat_threshold_floor': 18,           # minimum threshold to avoid noise
 
-
-    # Morphological operations
+    # Morphological cleanup
     'morph_opening_kernel': 3,
-    'morph_closing_kernel': 7,
-    
-    # Contour filtering (nodule characteristics)
-    'min_contour_area': 15,
-    'max_contour_area': 2000,
+    'morph_closing_kernel': 3,
+
+    # Contour filtering (nodule shape characteristics)
+    'min_contour_area': 4,
+    'max_contour_area': 5000,
     'min_eccentricity': 0.0,
-    'max_eccentricity': 0.85,
-    'min_solidity': 0.55,
+    'max_eccentricity': 0.92,
+    'min_solidity': 0.35,
+    'min_circularity': 0.2,
 
     'large_area_threshold':     200,   # px² cutoff between small/large eccentricity limits
-    'large_eccentricity_limit': 0.95,  # relaxed limit for large blobs
+    'large_eccentricity_limit': 0.98,  # relaxed limit for large blobs
 }
 
 # ==============================================================================
