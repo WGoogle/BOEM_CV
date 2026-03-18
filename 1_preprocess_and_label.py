@@ -1,248 +1,471 @@
 #!/usr/bin/env python3
 """
-Step 1: Preprocessing Pipeline
-------------------------------
-Preprocesses raw mosaics and generates proxy labels for training.
+Step 1: Preprocessing + Proxy Labelling Pipeline
+-------------------------------------------------
+CoralNet-inspired design:
+  - Idempotent: already-processed files are skipped on re-runs
+  - State-tracked: a JSON manifest records every mosaic's status
+  - Step-isolated: each stage (preprocess / label / patch) can be re-run
+    independently without restarting the whole pipeline
+  - Graceful degradation: per-file errors are logged and skipped; a summary
+    shows what succeeded/failed at the end
 
 Usage:
-    python 1_preprocess_and_label.py
+    python 1_preprocess_and_label.py                 # full run
+    python 1_preprocess_and_label.py --force         # re-run even if done
+    python 1_preprocess_and_label.py --step preprocess
+    python 1_preprocess_and_label.py --step label
+    python 1_preprocess_and_label.py --step patch
 """
 
 import sys
+import json
+import argparse
+import logging
 from pathlib import Path
+from datetime import datetime, timezone
+
 import cv2
 import numpy as np
 from tqdm import tqdm
-import logging
 
-# Add parent directory to path
 sys.path.append(str(Path(__file__).parent))
 
 import config
-from preprocessing.preprocessing.preprocess import MosaicPreprocessor, extract_patches, load_mosaic, save_mosaic
+from preprocessing.preprocessing.preprocess import (
+    MosaicPreprocessor, extract_patches, load_mosaic, save_mosaic
+)
 from preprocessing.preprocessing.proxy_labels import ProxyLabelGenerator, visualize_proxy_label
 from utils.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
+MANIFEST_PATH = config.OUTPUT_DIR / "pipeline_manifest.json"
 
-def preprocess_mosaics():
-    """Preprocess all raw mosaics."""
-    logger.info("="*80)
+
+# ---------------------------------------------------------------------------
+# Manifest helpers  (CoralNet pattern: audit trail for every file)
+# ---------------------------------------------------------------------------
+
+def load_manifest() -> dict:
+    """Load the pipeline state manifest, creating it if absent."""
+    if MANIFEST_PATH.exists():
+        with open(MANIFEST_PATH) as f:
+            return json.load(f)
+    return {"version": "1.0", "mosaics": {}}
+
+
+def save_manifest(manifest: dict):
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(MANIFEST_PATH, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def mosaic_key(mosaic_path: Path) -> str:
+    return mosaic_path.stem
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Preprocess raw mosaics
+# ---------------------------------------------------------------------------
+
+def run_preprocessing(mosaic_files: list, manifest: dict, force: bool) -> list:
+    logger.info("=" * 70)
     logger.info("STEP 1: PREPROCESSING RAW MOSAICS")
-    logger.info("="*80)
-    
-    # Get list of mosaics
-    raw_dir = config.RAW_MOSAICS_DIR
-    mosaic_files = list(raw_dir.glob("*.tif")) + list(raw_dir.glob("*.tiff")) + \
-                   list(raw_dir.glob("*.png"))
-    
-    if len(mosaic_files) == 0:
-        logger.error(f"No mosaic files found in {raw_dir}")
-        logger.error("Please place your .tif/.tiff/.png files in the data/raw_mosaics directory")
-        return []
-    
-    logger.info(f"Found {len(mosaic_files)} mosaics to preprocess")
-    
-    # Initialize preprocessor
+    logger.info("=" * 70)
+
     preprocessor = MosaicPreprocessor(config.PREPROCESSING)
-    
-    # Process each mosaic
-    preprocessed_files = []
-    
-    for mosaic_path in tqdm(mosaic_files, desc="Preprocessing mosaics"):
-        try:
-            # Load
-            mosaic = load_mosaic(mosaic_path)
-            
-            # Preprocess
-            preprocessed = preprocessor.preprocess_mosaic(mosaic)
-            
-            # Save
-            output_path = config.PREPROCESSED_DIR / f"{mosaic_path.stem}_preprocessed.png"
-            save_mosaic(preprocessed, output_path)
-            
-            preprocessed_files.append(output_path)
-            
-        except Exception as e:
-            logger.error(f"Failed to preprocess {mosaic_path.name}: {e}")
+    done, skipped, failed = [], [], []
+
+    for mosaic_path in tqdm(mosaic_files, desc="Preprocessing"):
+        key = mosaic_key(mosaic_path)
+        entry = manifest["mosaics"].setdefault(key, {})
+        out_path = config.PREPROCESSED_DIR / f"{key}_preprocessed.png"
+
+        # Skip if already done and output exists
+        if not force and entry.get("preprocessed") and out_path.exists():
+            skipped.append(mosaic_path)
             continue
-    
-    logger.info(f"Preprocessed {len(preprocessed_files)}/{len(mosaic_files)} mosaics")
-    return preprocessed_files
 
-
-def generate_proxy_labels(preprocessed_files):
-    """Generate proxy labels for all preprocessed mosaics."""
-    logger.info("="*80)
-    logger.info("STEP 2: GENERATING PROXY LABELS")
-    logger.info("="*80)
-    
-    # Initialize label generator
-    label_generator = ProxyLabelGenerator(config.PROXY_LABEL)
-    
-    # Process each mosaic
-    proxy_label_files = []
-    
-    for mosaic_path in tqdm(preprocessed_files, desc="Generating proxy labels"):
         try:
-            # Load preprocessed mosaic
-            mosaic = cv2.imread(str(mosaic_path), cv2.IMREAD_COLOR)
-            
-            # Generate proxy label (debug_dir saves intermediate images)
-            debug_dir = str(config.OUTPUT_DIR / "debug_proxy")
-            proxy_mask, stats = label_generator.generate_proxy_label(
+            mosaic = load_mosaic(mosaic_path)
+            # Base preprocessing (steps 1-5) — used by proxy labeler to
+            # preserve natural nodule-vs-sediment contrast.
+            base = preprocessor.preprocess_base(mosaic)
+            base_path = config.PREPROCESSED_DIR / f"{key}_preprocessed_base.png"
+            save_mosaic(base, base_path)
+
+            # Full preprocessing (base + nodule boost/sediment fade/unsharp)
+            # — used for training patches. Pass base to skip steps 1-5 again.
+            processed = preprocessor.preprocess_mosaic(mosaic, base=base)
+            save_mosaic(processed, out_path)
+
+            entry["preprocessed"] = str(out_path)
+            entry["preprocessed_base"] = str(base_path)
+            entry["preprocessed_at"] = datetime.now(timezone.utc).isoformat()
+            entry["source"] = str(mosaic_path)
+            entry["shape"] = list(processed.shape)
+            save_manifest(manifest)
+            done.append(out_path)
+
+        except Exception as exc:
+            logger.error(f"  FAILED {mosaic_path.name}: {exc}")
+            entry["preprocess_error"] = str(exc)
+            save_manifest(manifest)
+            failed.append(mosaic_path)
+
+    logger.info(
+        f"Preprocessing: {len(done)} done, {len(skipped)} skipped, "
+        f"{len(failed)} failed"
+    )
+    return done + [
+        Path(manifest["mosaics"][mosaic_key(p)]["preprocessed"])
+        for p in skipped
+        if manifest["mosaics"].get(mosaic_key(p), {}).get("preprocessed")
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Generate proxy labels
+# ---------------------------------------------------------------------------
+
+def run_proxy_labelling(preprocessed_paths: list, manifest: dict, force: bool) -> list:
+    logger.info("=" * 70)
+    logger.info("STEP 2: GENERATING PROXY LABELS")
+    logger.info("=" * 70)
+
+    # Validate label config before starting (CoralNet: fail fast)
+    required_keys = [
+        "tophat_radii", "tophat_percentile", "tophat_threshold_floor",
+        "min_contour_area", "max_contour_area",
+        "min_solidity", "min_circularity",
+    ]
+    missing = [k for k in required_keys if k not in config.PROXY_LABEL]
+    if missing:
+        logger.error(f"PROXY_LABEL config is missing keys: {missing}")
+        logger.error("Fix config.py before continuing.")
+        return []
+
+    label_gen = ProxyLabelGenerator(config.PROXY_LABEL)
+    debug_dir = str(config.OUTPUT_DIR / "debug_proxy")
+    done, skipped, failed = [], [], []
+
+    for pre_path in tqdm(preprocessed_paths, desc="Proxy labelling"):
+        key = pre_path.stem.replace("_preprocessed", "")
+        entry = manifest["mosaics"].setdefault(key, {})
+        mask_path = config.PROXY_LABELS_DIR / f"{key}_mask.png"
+
+        if not force and entry.get("proxy_label") and mask_path.exists():
+            skipped.append(mask_path)
+            continue
+
+        try:
+            # Use the base-preprocessed (lightly processed) image for proxy
+            # labeling so that natural nodule-vs-sediment contrast is intact.
+            # Fall back to the fully preprocessed image if base is missing
+            # (e.g. for files processed before this change).
+            base_path = Path(str(pre_path).replace("_preprocessed.png", "_preprocessed_base.png"))
+            load_path = base_path if base_path.exists() else pre_path
+            mosaic = cv2.imread(str(load_path), cv2.IMREAD_COLOR)
+            if mosaic is None:
+                raise ValueError(f"Could not read {load_path}")
+
+            proxy_mask, stats = label_gen.generate_proxy_label(
                 mosaic,
                 debug_dir=debug_dir,
-                debug_prefix=mosaic_path.stem,
+                debug_prefix=key,
             )
-            
-            # Save mask
-            mask_path = config.PROXY_LABELS_DIR / f"{mosaic_path.stem}_mask.png"
+
+            # Reject degenerate masks (CoralNet: graceful degradation)
+            coverage = stats["coverage_percent"]
+            if coverage < 0.1:
+                logger.warning(
+                    f"  {key}: coverage={coverage:.2f}% — suspiciously sparse, "
+                    f"check debug images in {debug_dir}"
+                )
+            elif coverage > 60.0:
+                logger.warning(
+                    f"  {key}: coverage={coverage:.2f}% — suspiciously dense, "
+                    f"check debug images in {debug_dir}"
+                )
+
             cv2.imwrite(str(mask_path), proxy_mask)
-            
-            # Save visualization
-            if config.VISUALIZATION['save_proxy_labels']:
-                vis = visualize_proxy_label(mosaic, proxy_mask, alpha=config.VISUALIZATION['overlay_alpha'])
-                vis_path = config.PROXY_LABELS_DIR / f"{mosaic_path.stem}_vis.png"
+
+            if config.VISUALIZATION["save_proxy_labels"]:
+                vis = visualize_proxy_label(
+                    mosaic, proxy_mask, alpha=config.VISUALIZATION["overlay_alpha"]
+                )
+                vis_path = config.PROXY_LABELS_DIR / f"{key}_vis.png"
                 cv2.imwrite(str(vis_path), vis)
-            
-            proxy_label_files.append(mask_path)
-            
-        except Exception as e:
-            logger.error(f"Failed to generate proxy label for {mosaic_path.name}: {e}")
-            continue
-    
-    logger.info(f"Generated {len(proxy_label_files)}/{len(preprocessed_files)} proxy labels")
-    return proxy_label_files
+
+            entry["proxy_label"] = str(mask_path)
+            entry["proxy_stats"] = stats
+            entry["proxy_label_at"] = datetime.now(timezone.utc).isoformat()
+            save_manifest(manifest)
+            done.append(mask_path)
+
+        except Exception as exc:
+            logger.error(f"  FAILED {pre_path.name}: {exc}")
+            entry["proxy_label_error"] = str(exc)
+            save_manifest(manifest)
+            failed.append(pre_path)
+
+    logger.info(
+        f"Proxy labelling: {len(done)} done, {len(skipped)} skipped, "
+        f"{len(failed)} failed"
+    )
+    return done + skipped
 
 
-def extract_and_save_patches(preprocessed_files, proxy_label_files):
-    """Extract patches from preprocessed mosaics and masks."""
-    logger.info("="*80)
+# ---------------------------------------------------------------------------
+# Step 3: Extract patches
+# ---------------------------------------------------------------------------
+
+def run_patch_extraction(
+    preprocessed_paths: list,
+    proxy_mask_paths: list,
+    manifest: dict,
+    force: bool,
+) -> list:
+    logger.info("=" * 70)
     logger.info("STEP 3: EXTRACTING PATCHES")
-    logger.info("="*80)
-    
-    patch_config = config.PREPROCESSING
+    logger.info("=" * 70)
+
+    patch_cfg = config.PREPROCESSING
     manual_dir = config.MANUAL_LABELS_DIR
-    
-    # Create patch directories
-    patch_images_dir = config.PATCHES_DIR / "images"
-    patch_masks_dir = config.PATCHES_DIR / "masks"
-    patch_images_dir.mkdir(parents=True, exist_ok=True)
-    patch_masks_dir.mkdir(parents=True, exist_ok=True)
-    
-    total_patches = 0
+    images_dir = config.PATCHES_DIR / "images"
+    masks_dir = config.PATCHES_DIR / "masks"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+
     patch_manifest = []
-    
-    for mosaic_path, mask_path in tqdm(zip(preprocessed_files, proxy_label_files), 
-                                       total=len(preprocessed_files),
-                                       desc="Extracting patches"):
+    total_patches = 0
+    skipped_mosaics = 0
+
+    path_pairs = list(zip(preprocessed_paths, proxy_mask_paths))
+
+    for pre_path, mask_path in tqdm(path_pairs, desc="Extracting patches"):
+        key = pre_path.stem.replace("_preprocessed", "")
+        entry = manifest["mosaics"].setdefault(key, {})
+
+        # Skip if this mosaic's patches are already recorded and files exist
+        if not force and entry.get("patches"):
+            first = images_dir / f"{entry['patches'][0]}.png"
+            if first.exists():
+                patch_manifest.extend(entry.get("patch_records", []))
+                skipped_mosaics += 1
+                continue
+
         try:
-            # Load mosaic and mask
-            mosaic = cv2.imread(str(mosaic_path), cv2.IMREAD_COLOR)
+            mosaic = cv2.imread(str(pre_path), cv2.IMREAD_COLOR)
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-            
-            # Extract patches
-            image_patches, coords = extract_patches(
+            if mosaic is None or mask is None:
+                raise ValueError(f"Could not read {pre_path} or {mask_path}")
+
+            img_patches, coords = extract_patches(
                 mosaic,
-                patch_h=patch_config['patch_height'],
-                patch_w=patch_config['patch_width'],
-                stride_v=patch_config['patch_stride_vertical'],
-                stride_h=patch_config['patch_stride_horizontal'],
-                min_std=patch_config['min_patch_std'],
-                min_mean=patch_config['min_patch_mean']
+                patch_h=patch_cfg["patch_height"],
+                patch_w=patch_cfg["patch_width"],
+                stride_v=patch_cfg["patch_stride_vertical"],
+                stride_h=patch_cfg["patch_stride_horizontal"],
+                min_std=patch_cfg["min_patch_std"],
+                min_mean=patch_cfg["min_patch_mean"],
             )
-            
-            # Extract corresponding mask patches
+
+            mosaic_patch_ids = []
+            mosaic_records = []
+
             for i, (y, x) in enumerate(coords):
-                patch_h = patch_config['patch_height']
-                patch_w = patch_config['patch_width']
-                
-                # Generate the standard patch ID
-                patch_id = f"{mosaic_path.stem}_patch_{i:04d}"
-                
-                #Check for ground truth
-                manual_patch_path = manual_dir / f"{patch_id}.png"
-                
-                if manual_patch_path.exists():
-                    # Load the manual binary mask instead of slicing the proxy
-                    mask_patch = cv2.imread(str(manual_patch_path), cv2.IMREAD_GRAYSCALE)
+                ph = patch_cfg["patch_height"]
+                pw = patch_cfg["patch_width"]
+                patch_id = f"{key}_patch_{i:04d}"
+
+                # Manual label overrides proxy (CoralNet pattern: explicit > inferred)
+                manual_path = manual_dir / f"{patch_id}.png"
+                if manual_path.exists():
+                    mask_patch = cv2.imread(str(manual_path), cv2.IMREAD_GRAYSCALE)
+                    label_source = "manual"
                 else:
-                    # Default: Extract from proxy mask
-                    mask_patch = mask[y:y+patch_h, x:x+patch_w]
-                # ----------------------------------------------------
-                
-                # Save patches
-                image_patch_path = patch_images_dir / f"{patch_id}.png"
-                mask_patch_path = patch_masks_dir / f"{patch_id}.png"
-                
-                cv2.imwrite(str(image_patch_path), image_patches[i])
-                cv2.imwrite(str(mask_patch_path), mask_patch)
-                
-                patch_manifest.append({
-                    'image_path': str(image_patch_path),
-                    'mask_path': str(mask_patch_path),
-                    'source_mosaic': mosaic_path.name,
-                    'coordinates': (y, x)
-                })
-                
+                    mask_patch = mask[y:y + ph, x:x + pw]
+                    label_source = "proxy"
+
+                img_patch_path = images_dir / f"{patch_id}.png"
+                msk_patch_path = masks_dir / f"{patch_id}.png"
+                cv2.imwrite(str(img_patch_path), img_patches[i])
+                cv2.imwrite(str(msk_patch_path), mask_patch)
+
+                record = {
+                    "patch_id": patch_id,
+                    "image_path": str(img_patch_path),
+                    "mask_path": str(msk_patch_path),
+                    "source_mosaic": pre_path.name,
+                    "coordinates": [y, x],
+                    "label_source": label_source,
+                }
+                mosaic_patch_ids.append(patch_id)
+                mosaic_records.append(record)
                 total_patches += 1
-        
-        except Exception as e:
-            logger.error(f"Failed to extract patches from {mosaic_path.name}: {e}")
-            continue
-    
-    logger.info(f"Extracted {total_patches} total patches")
-    
-    # Save manifest
-    import json
-    manifest_path = config.PATCHES_DIR / "patch_manifest.json"
-    with open(manifest_path, 'w') as f:
+
+            entry["patches"] = mosaic_patch_ids
+            entry["patch_records"] = mosaic_records
+            entry["patches_at"] = datetime.now(timezone.utc).isoformat()
+            patch_manifest.extend(mosaic_records)
+            save_manifest(manifest)
+
+        except Exception as exc:
+            logger.error(f"  FAILED {pre_path.name}: {exc}")
+            entry["patch_error"] = str(exc)
+            save_manifest(manifest)
+
+    # Write flat patch manifest for use by 2_train.py
+    flat_manifest_path = config.PATCHES_DIR / "patch_manifest.json"
+    with open(flat_manifest_path, "w") as f:
         json.dump(patch_manifest, f, indent=2)
-    logger.info(f"Saved patch manifest: {manifest_path}")
-    
+
+    logger.info(
+        f"Patch extraction: {total_patches} patches from "
+        f"{len(path_pairs) - skipped_mosaics} mosaics "
+        f"({skipped_mosaics} mosaics skipped, already done)"
+    )
+    logger.info(f"Manifest saved: {flat_manifest_path}")
     return patch_manifest
 
 
+# ---------------------------------------------------------------------------
+# Input discovery and validation
+# ---------------------------------------------------------------------------
+
+def find_raw_mosaics() -> list:
+    exts = ["*.tif", "*.tiff", "*.png"]
+    files = []
+    for ext in exts:
+        files.extend(config.RAW_MOSAICS_DIR.glob(ext))
+    return sorted(files)
+
+
+def validate_inputs(mosaic_files: list) -> bool:
+    if not mosaic_files:
+        logger.error(f"No mosaics found in {config.RAW_MOSAICS_DIR}")
+        logger.error("Place .tif / .tiff / .png files there and re-run.")
+        return False
+    logger.info(f"Found {len(mosaic_files)} mosaic(s) to process")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
-    """Run full preprocessing pipeline."""
-    # Setup logging
+    parser = argparse.ArgumentParser(description="Preprocessing + proxy labelling pipeline")
+    parser.add_argument(
+        "--step",
+        choices=["preprocess", "label", "patch"],
+        default=None,
+        help="Run only a single stage (default: all three)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-process files even if they were already done",
+    )
+    args = parser.parse_args()
+
     setup_logging(
         log_dir=config.LOGS_DIR,
-        log_level='INFO',
+        log_level="INFO",
         log_to_file=True,
-        log_to_console=True
+        log_to_console=True,
     )
-    
-    logger.info("Starting preprocessing pipeline")
-    logger.info(f"Raw mosaics directory: {config.RAW_MOSAICS_DIR}")
-    logger.info(f"Output directory: {config.OUTPUT_DIR}")
-    
-    # Step 1: Preprocess mosaics
-    preprocessed_files = preprocess_mosaics()
-    
-    if len(preprocessed_files) == 0:
-        logger.error("No mosaics were preprocessed. Exiting.")
+
+    logger.info("=" * 70)
+    logger.info("BOEM CV  —  Preprocessing + Proxy Labelling Pipeline")
+    logger.info("=" * 70)
+    logger.info(f"Raw mosaics : {config.RAW_MOSAICS_DIR}")
+    logger.info(f"Output dir  : {config.OUTPUT_DIR}")
+    logger.info(f"Force re-run: {args.force}")
+    if args.step:
+        logger.info(f"Running single step: {args.step}")
+
+    manifest = load_manifest()
+    mosaic_files = find_raw_mosaics()
+
+    if not validate_inputs(mosaic_files):
         return
-    
-    # Step 2: Generate proxy labels
-    proxy_label_files = generate_proxy_labels(preprocessed_files)
-    
-    if len(proxy_label_files) == 0:
-        logger.error("No proxy labels were generated. Exiting.")
+
+    run_all = args.step is None
+
+    # ── Stage 1: Preprocess ──────────────────────────────────────────────────
+    if run_all or args.step == "preprocess":
+        preprocessed = run_preprocessing(mosaic_files, manifest, args.force)
+    else:
+        # Collect paths recorded in manifest for downstream stages
+        preprocessed = [
+            Path(v["preprocessed"])
+            for v in manifest["mosaics"].values()
+            if v.get("preprocessed") and Path(v["preprocessed"]).exists()
+        ]
+        logger.info(f"Skipping preprocess step — using {len(preprocessed)} cached files")
+
+    if not preprocessed:
+        logger.error("No preprocessed mosaics available. Exiting.")
         return
-    
-    # Step 3: Extract patches
-    patch_manifest = extract_and_save_patches(preprocessed_files, proxy_label_files)
-    
-    logger.info("="*80)
-    logger.info("PREPROCESSING COMPLETE")
-    logger.info("="*80)
-    logger.info(f"Preprocessed mosaics: {len(preprocessed_files)}")
-    logger.info(f"Proxy labels: {len(proxy_label_files)}")
-    logger.info(f"Patches extracted: {len(patch_manifest)}")
-    logger.info(f"\nNext step: Run 2_train.py to train the model")
+
+    # ── Stage 2: Proxy labels ────────────────────────────────────────────────
+    if run_all or args.step == "label":
+        proxy_masks = run_proxy_labelling(preprocessed, manifest, args.force)
+    else:
+        proxy_masks = [
+            Path(v["proxy_label"])
+            for v in manifest["mosaics"].values()
+            if v.get("proxy_label") and Path(v["proxy_label"]).exists()
+        ]
+        logger.info(f"Skipping label step — using {len(proxy_masks)} cached masks")
+
+    if not proxy_masks:
+        logger.error("No proxy labels available. Exiting.")
+        return
+
+    # ── Stage 3: Patch extraction ────────────────────────────────────────────
+    if run_all or args.step == "patch":
+        # Pair preprocessed images with their proxy masks by stem
+        mask_by_key = {
+            p.stem.replace("_mask", ""): p for p in proxy_masks
+        }
+        paired_pre, paired_mask = [], []
+        for pre in preprocessed:
+            key = pre.stem.replace("_preprocessed", "")
+            if key in mask_by_key:
+                paired_pre.append(pre)
+                paired_mask.append(mask_by_key[key])
+            else:
+                logger.warning(f"No proxy mask found for {pre.name}, skipping patches")
+
+        patch_manifest = run_patch_extraction(
+            paired_pre, paired_mask, manifest, args.force
+        )
+    else:
+        patch_manifest = []
+        for v in manifest["mosaics"].values():
+            patch_manifest.extend(v.get("patch_records", []))
+        logger.info(f"Skipping patch step — {len(patch_manifest)} patches in manifest")
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    logger.info("=" * 70)
+    logger.info("PIPELINE COMPLETE")
+    logger.info("=" * 70)
+    logger.info(f"  Preprocessed mosaics : {len(preprocessed)}")
+    logger.info(f"  Proxy label masks    : {len(proxy_masks)}")
+    logger.info(f"  Patches in manifest  : {len(patch_manifest)}")
+
+    manual_count = sum(1 for r in patch_manifest if r.get("label_source") == "manual")
+    if manual_count:
+        logger.info(
+            f"  Manual label overrides: {manual_count} / {len(patch_manifest)} patches"
+        )
+
+    logger.info(f"\nPipeline manifest: {MANIFEST_PATH}")
+    logger.info("Next step: python 2_train.py")
 
 
 if __name__ == "__main__":

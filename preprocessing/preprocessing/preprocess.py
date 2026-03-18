@@ -201,6 +201,44 @@ class MosaicPreprocessor:
         )
         return cv2.cvtColor(cv2.merge([l_boosted, a, b]), cv2.COLOR_LAB2BGR)
     
+    def apply_sediment_fade(self, image: np.ndarray) -> np.ndarray:
+        """
+        Fade gray sediment blobs by blending bright (non-nodule) regions toward
+        a large-scale smooth version of the L channel.
+
+        Sediment is identified as pixels with L above `sediment_l_threshold`.
+        Those regions are blended toward a heavily blurred version of L
+        (sigma = `sediment_fade_blur_sigma`), which washes out both grain-scale
+        texture and macro-scale blurb boundaries.  Dark nodule pixels fall below
+        the threshold and are left untouched.
+        """
+        if not self.config.get('apply_sediment_fade', False):
+            return image
+
+        fade_sigma   = self.config.get('sediment_fade_blur_sigma', 15.0)
+        fade_strength = self.config.get('sediment_fade_strength', 0.6)
+        l_threshold  = self.config.get('sediment_l_threshold', 80)
+
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        # Large-scale smooth version of L
+        l_smooth = cv2.GaussianBlur(l.astype(np.float32), (0, 0), fade_sigma)
+
+        # Soft sediment mask: 0 in dark (nodule) regions, 1 in bright (sediment) regions
+        sediment_mask = np.clip((l.astype(np.float32) - l_threshold) / 20.0, 0.0, 1.0)
+        sediment_mask = cv2.GaussianBlur(sediment_mask, (0, 0), 5.0)
+
+        blend_weight = sediment_mask * fade_strength
+        l_faded = l.astype(np.float32) * (1.0 - blend_weight) + l_smooth * blend_weight
+        l_faded = np.clip(l_faded, 0, 255).astype(np.uint8)
+
+        logger.debug(
+            f"Sediment fade: sigma={fade_sigma}, strength={fade_strength}, "
+            f"l_threshold={l_threshold}"
+        )
+        return cv2.cvtColor(cv2.merge([l_faded, a, b]), cv2.COLOR_LAB2BGR)
+
     def apply_unsharp_mask(self, image: np.ndarray) -> np.ndarray:
         """
         Sharpen nodule boundaries by applying unsharp masking on the L channel.
@@ -223,26 +261,31 @@ class MosaicPreprocessor:
         return cv2.cvtColor(sharpened, cv2.COLOR_LAB2BGR)
     
     
-    def preprocess_mosaic(self, image: np.ndarray) -> np.ndarray:
+    def preprocess_base(self, image: np.ndarray) -> np.ndarray:
         """
-        Full preprocessing pipeline for a single mosaic.
-        
+        Base preprocessing pipeline (steps 1-5): orientation, colour conversion,
+        white balance, bilateral filtering, and CLAHE.
+
+        This is intentionally lightweight so that natural nodule-vs-sediment
+        contrast is preserved for proxy label generation.  The heavy
+        enhancement steps (nodule boost, sediment fade, unsharp mask) are
+        applied separately in preprocess_mosaic().
+
         Args:
             image: Input mosaic (H, W, C) in BGR format
-            
+
         Returns:
-            Preprocessed mosaic (H, W, 3) uint8
+            Base-preprocessed mosaic (H, W, 3) uint8
         """
-        
         # 1. Orientation normalization
         image = self.normalize_orientation(image)
-        
+
         # 2. Color space conversion (handles RGBA if needed)
         image = self.convert_color_space(image)
-        
+
         # 3. Gray-world white balance
         image = self.apply_gray_world_white_balance(image)
-        
+
         # 4. Bilateral filtering
         image = self.apply_bilateral_filter(image)
 
@@ -252,13 +295,41 @@ class MosaicPreprocessor:
 
         # 5. CLAHE in LAB space
         image = self.apply_clahe_lab(image)
-        
-        # 6. applying nodule boost 
+
+        logger.info(f"Base-preprocessed mosaic: shape={image.shape}, dtype={image.dtype}")
+        return image
+
+    def preprocess_mosaic(self, image: np.ndarray, base: np.ndarray = None) -> np.ndarray:
+        """
+        Full preprocessing pipeline for a single mosaic.
+
+        Calls preprocess_base() then applies the heavy enhancement steps
+        (nodule boost, sediment fade, unsharp mask) that improve training-patch
+        quality but would destroy the natural contrast needed for proxy labeling.
+
+        Args:
+            image: Input mosaic (H, W, C) in BGR format
+            base:  Optional already-computed base-preprocessed image.
+                   If provided, steps 1-5 are skipped to avoid double processing.
+
+        Returns:
+            Fully preprocessed mosaic (H, W, 3) uint8
+        """
+        # Accept an already-base-processed image so callers can reuse it
+        # without running steps 1-5 twice.
+        if base is None:
+            base = self.preprocess_base(image)
+        image = base
+
+        # 6. Nodule boost
         image = self.apply_nodule_boost(image)
 
-        # 7. Unsharp masking 
+        # 7. Sediment fade (suppresses gray blobs before sharpening)
+        image = self.apply_sediment_fade(image)
+
+        # 8. Unsharp masking
         image = self.apply_unsharp_mask(image)
-        
+
         logger.info(f"Preprocessed mosaic: shape={image.shape}, dtype={image.dtype}")
         return image
 
